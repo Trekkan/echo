@@ -4,6 +4,7 @@ import (
 	"bytes"
 	stdContext "context"
 	"errors"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -12,12 +13,14 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 )
 
 type (
 	user struct {
-		ID   int    `json:"id" xml:"id" form:"id" query:"id"`
-		Name string `json:"name" xml:"name" form:"name" query:"name"`
+		ID   int    `json:"id" xml:"id" form:"id" query:"id" param:"id"`
+		Name string `json:"name" xml:"name" form:"name" query:"name" param:"name"`
 	}
 )
 
@@ -428,6 +431,71 @@ func TestEchoStartTLS(t *testing.T) {
 	e.Close()
 }
 
+func TestEchoStartTLSByteString(t *testing.T) {
+	cert, err := ioutil.ReadFile("_fixture/certs/cert.pem")
+	require.NoError(t, err)
+	key, err := ioutil.ReadFile("_fixture/certs/key.pem")
+	require.NoError(t, err)
+
+	testCases := []struct {
+		cert        interface{}
+		key         interface{}
+		expectedErr error
+		name        string
+	}{
+		{
+			cert:        "_fixture/certs/cert.pem",
+			key:         "_fixture/certs/key.pem",
+			expectedErr: nil,
+			name:        `ValidCertAndKeyFilePath`,
+		},
+		{
+			cert:        cert,
+			key:         key,
+			expectedErr: nil,
+			name:        `ValidCertAndKeyByteString`,
+		},
+		{
+			cert:        cert,
+			key:         1,
+			expectedErr: ErrInvalidCertOrKeyType,
+			name:        `InvalidKeyType`,
+		},
+		{
+			cert:        0,
+			key:         key,
+			expectedErr: ErrInvalidCertOrKeyType,
+			name:        `InvalidCertType`,
+		},
+		{
+			cert:        0,
+			key:         1,
+			expectedErr: ErrInvalidCertOrKeyType,
+			name:        `InvalidCertAndKeyTypes`,
+		},
+	}
+
+	for _, test := range testCases {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			e := New()
+			e.HideBanner = true
+
+			go func() {
+				err := e.StartTLS(":0", test.cert, test.key)
+				if test.expectedErr != nil {
+					require.EqualError(t, err, test.expectedErr.Error())
+				} else if err != http.ErrServerClosed { // Prevent the test to fail after closing the servers
+					require.NoError(t, err)
+				}
+			}()
+			time.Sleep(200 * time.Millisecond)
+
+			require.NoError(t, e.Close())
+		})
+	}
+}
+
 func TestEchoStartAutoTLS(t *testing.T) {
 	e := New()
 	errChan := make(chan error, 0)
@@ -443,6 +511,17 @@ func TestEchoStartAutoTLS(t *testing.T) {
 	default:
 		assert.NoError(t, e.Close())
 	}
+}
+
+func TestEchoStartH2CServer(t *testing.T) {
+	e := New()
+	e.Debug = true
+	h2s := &http2.Server{}
+
+	go func() {
+		assert.NoError(t, e.StartH2CServer(":0", h2s))
+	}()
+	time.Sleep(200 * time.Millisecond)
 }
 
 func testMethod(t *testing.T, method, path string, e *Echo) {
@@ -464,10 +543,21 @@ func request(method, path string, e *Echo) (int, string) {
 }
 
 func TestHTTPError(t *testing.T) {
-	err := NewHTTPError(http.StatusBadRequest, map[string]interface{}{
-		"code": 12,
+	t.Run("non-internal", func(t *testing.T) {
+		err := NewHTTPError(http.StatusBadRequest, map[string]interface{}{
+			"code": 12,
+		})
+
+		assert.Equal(t, "code=400, message=map[code:12]", err.Error())
+
 	})
-	assert.Equal(t, "code=400, message=map[code:12]", err.Error())
+	t.Run("internal", func(t *testing.T) {
+		err := NewHTTPError(http.StatusBadRequest, map[string]interface{}{
+			"code": 12,
+		})
+		err.SetInternal(errors.New("internal error"))
+		assert.Equal(t, "code=400, message=map[code:12], internal=internal error", err.Error())
+	})
 }
 
 func TestEchoClose(t *testing.T) {
